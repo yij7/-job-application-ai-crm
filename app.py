@@ -597,25 +597,23 @@ def extract_text_from_uploaded_images(uploaded_files):
     return "\n\n".join(extracted_texts), error_messages
 
 
-def get_missing_basic_fields():
-    field_labels = {
-        "company_name": "公司名",
-        "job_title": "岗位名",
-        "job_direction": "岗位方向",
-        "salary": "薪资",
-        "location": "地点",
-        "platform": "投递平台",
-        "status": "投递状态",
-        "notes": "备注",
-        "chat_text": "聊天记录文本",
-    }
+def fill_missing_screenshot_fields():
+    fields_to_fill = [
+        "company_name",
+        "job_title",
+        "job_direction",
+        "salary",
+        "location",
+        "platform",
+        "notes",
+    ]
 
-    missing_fields = []
-    for key, label in field_labels.items():
+    for key in fields_to_fill:
         if not clean_value(st.session_state[key]):
-            missing_fields.append(label)
+            st.session_state[key] = "待补充"
 
-    return missing_fields
+    if st.session_state.status not in STATUS_OPTIONS:
+        st.session_state.status = ""
 
 def clear_ai_result_from_session():
     for key in list(AI_FIELD_KEYS.values()) + list(DIAGNOSIS_FIELD_KEYS.values()):
@@ -688,8 +686,50 @@ def get_feishu_config():
 def check_feishu_config(config):
     missing_keys = [key for key, value in config.items() if not value]
     if missing_keys:
-        return "请先在 .env 中配置 FEISHU_APP_ID、FEISHU_APP_SECRET、FEISHU_APP_TOKEN、FEISHU_TABLE_ID"
+        missing_text = "、".join(missing_keys)
+        return f"飞书同步失败：缺少配置 {missing_text}。本地保存不受影响。"
     return ""
+
+
+def get_feishu_config_status_text():
+    config = get_feishu_config()
+    labels = {
+        "app_id": "FEISHU_APP_ID",
+        "app_secret": "FEISHU_APP_SECRET",
+        "app_token": "FEISHU_APP_TOKEN",
+        "table_id": "FEISHU_TABLE_ID",
+    }
+    status_lines = []
+    for key, label in labels.items():
+        status = "已配置" if clean_value(config.get(key, "")) else "未配置"
+        status_lines.append(f"{label}：{status}")
+    return "\n".join(status_lines)
+
+
+def translate_feishu_error(response_text):
+    try:
+        result = json.loads(response_text)
+    except json.JSONDecodeError:
+        return "飞书同步失败：接口返回异常。本地保存不受影响。"
+
+    code = result.get("code")
+    msg = clean_value(result.get("msg", ""))
+    error_text = f"{code} {msg}".upper()
+
+    if code == 91402 or "NOTEXIST" in error_text:
+        return (
+            "飞书同步失败：未找到对应的多维表格或数据表。"
+            "请检查 Streamlit Secrets 中的 FEISHU_APP_TOKEN 和 FEISHU_TABLE_ID 是否与当前飞书表一致，"
+            "也可能是表格权限不足。本地保存不受影响。"
+        )
+
+    if "FIELDNAMENOTFOUND" in error_text:
+        return "飞书同步失败：飞书表格缺少字段。请先运行字段检查脚本或在飞书中补齐字段。本地保存不受影响。"
+
+    if code:
+        return f"飞书同步失败：{msg or '飞书接口返回错误'}（错误码 {code}）。本地保存不受影响。"
+
+    return "飞书同步失败：请检查飞书配置和表格权限。本地保存不受影响。"
 
 
 def get_feishu_tenant_access_token(config):
@@ -699,11 +739,13 @@ def get_feishu_tenant_access_token(config):
     }
 
     response = requests.post(FEISHU_TOKEN_URL, json=payload, timeout=30)
-    response.raise_for_status()
+    if response.status_code != 200:
+        raise RuntimeError(translate_feishu_error(response.text))
+
     result = response.json()
 
     if result.get("code") != 0:
-        raise RuntimeError(result.get("msg", "获取 tenant_access_token 失败"))
+        raise RuntimeError(translate_feishu_error(response.text))
 
     return result["tenant_access_token"]
 
@@ -732,11 +774,11 @@ def get_feishu_field_names(config, tenant_access_token):
     print(f"飞书字段列表 response.text: {response.text}")
 
     if response.status_code != 200:
-        raise RuntimeError(f"读取飞书字段列表失败：{response.text}")
+        raise RuntimeError(translate_feishu_error(response.text))
 
     result = response.json()
     if result.get("code") != 0:
-        raise RuntimeError(f"读取飞书字段列表失败：{response.text}")
+        raise RuntimeError(translate_feishu_error(response.text))
 
     fields = result.get("data", {}).get("items", [])
     return {field.get("field_name", "") for field in fields if field.get("field_name")}
@@ -776,20 +818,18 @@ def sync_record_to_feishu(record):
         print(f"飞书写入记录 response.text: {response.text}")
 
         if response.status_code != 200:
-            return f"飞书同步失败：{response.text}"
+            return translate_feishu_error(response.text)
 
         result = response.json()
 
         if result.get("code") != 0:
-            if result.get("msg") == "FieldNameNotFound":
-                return f"飞书同步失败：{response.text}"
-            return f"飞书同步失败：{result.get('msg', '未知错误')}；完整响应：{response.text}"
+            return translate_feishu_error(response.text)
 
         return ""
     except requests.exceptions.RequestException as error:
-        return f"飞书同步失败：{error}"
+        return f"飞书同步失败：网络请求异常，请稍后重试。本地保存不受影响。{error}"
     except (KeyError, RuntimeError) as error:
-        return f"飞书同步失败：{error}"
+        return str(error)
 
 
 def get_feishu_records_url(config):
@@ -932,10 +972,29 @@ st.set_page_config(page_title="AI 求职投递管理与沟通分析系统", layo
 st.markdown(
     """
     <style>
+    #MainMenu, footer, header, [data-testid="stToolbar"], [data-testid="stDecoration"], .stDeployButton {
+        visibility: hidden;
+        height: 0;
+    }
+    .block-container {
+        max-width: 980px;
+        padding-top: 1.25rem;
+    }
+    h1 {
+        font-size: 1.65rem !important;
+        line-height: 1.2 !important;
+    }
+    h2, h3 {
+        line-height: 1.25 !important;
+    }
+    div[data-testid="stAlert"] {
+        border-radius: 8px;
+    }
     @media (max-width: 640px) {
         .block-container {
             padding-left: 1rem;
             padding-right: 1rem;
+            padding-top: 0.75rem;
         }
         div[data-testid="stHorizontalBlock"] {
             flex-wrap: wrap;
@@ -948,6 +1007,9 @@ st.markdown(
         }
         .stButton button {
             width: 100%;
+        }
+        h1 {
+            font-size: 1.35rem !important;
         }
     }
     </style>
@@ -963,6 +1025,9 @@ if "pending_edit_index" not in st.session_state:
 
 if "success_message" not in st.session_state:
     st.session_state.success_message = ""
+
+if "last_saved_index" not in st.session_state:
+    st.session_state.last_saved_index = None
 
 for field_key in FIELD_KEYS.values():
     if field_key not in st.session_state:
@@ -992,14 +1057,14 @@ if st.session_state.pending_edit_index is not None:
     load_record_to_form(st.session_state.pending_edit_index)
     st.session_state.pending_edit_index = None
 
-st.title("AI 求职投递管理与沟通分析系统")
-st.caption("V5：一段粘贴生成结构化求职记录，并提供产品岗深度诊断。")
+st.markdown("# BossPilot")
+st.caption("AI 求职投递管理与岗位诊断系统")
 
 if st.session_state.success_message:
     st.success(st.session_state.success_message)
     st.session_state.success_message = ""
 
-st.info("飞书同步需要在项目根目录 .env 中配置 FEISHU_APP_ID、FEISHU_APP_SECRET、FEISHU_APP_TOKEN、FEISHU_TABLE_ID。")
+st.info("飞书同步为可选功能；未配置或配置错误时，不影响截图识别和本地保存。")
 
 st.subheader("推荐使用方式")
 st.markdown(
@@ -1007,67 +1072,62 @@ st.markdown(
     "- 电脑端：适合查看、筛选、编辑、同步飞书和复盘"
 )
 
-st.subheader("截图上传解析")
-st.caption("上传 Boss 岗位页、公司介绍页或 HR 聊天截图，系统会尝试识别截图内容并生成求职记录。")
-st.info("建议在手机 Boss 直聘截图后，直接在手机浏览器打开本工具上传截图。")
-uploaded_images = st.file_uploader(
-    "上传 1-3 张截图",
-    type=["png", "jpg", "jpeg"],
-    accept_multiple_files=True,
-)
+with st.container(border=True):
+    st.subheader("截图上传")
+    st.caption("建议上传 2–5 张 Boss 岗位截图 / 公司介绍 / HR 聊天截图，最多 8 张。")
+    st.info("手机端建议先在相册中整理好截图，再一次性选择上传。")
+    uploaded_images = st.file_uploader(
+        "上传截图",
+        type=["png", "jpg", "jpeg"],
+        accept_multiple_files=True,
+    )
 
-if st.button("AI识别截图并生成记录"):
-    if not uploaded_images:
-        st.warning("请先上传 1-3 张截图。")
-    elif len(uploaded_images) > 3:
-        st.warning("最多上传 3 张截图，请减少图片数量后重试。")
-    else:
-        with st.spinner("正在识别截图文字..."):
-            extracted_text, ocr_errors = extract_text_from_uploaded_images(uploaded_images)
-
-        if ocr_errors:
-            st.warning("截图文字识别不完整，请补充文字或上传更清晰截图。")
-            for error_message in ocr_errors:
-                st.caption(error_message)
-
-        if not extracted_text:
-            st.warning("截图文字识别不完整，请补充文字或上传更清晰截图。")
+    if st.button("AI识别截图并生成记录"):
+        if not uploaded_images:
+            st.warning("请先上传截图。")
+        elif len(uploaded_images) > 8:
+            st.warning("最多上传 8 张截图，请减少截图数量后重试。")
         else:
-            with st.spinner("正在根据截图内容生成求职记录..."):
-                ai_result, error_message = smart_parse_with_deepseek(extracted_text)
+            with st.spinner("正在识别截图文字..."):
+                extracted_text, ocr_errors = extract_text_from_uploaded_images(uploaded_images)
+
+            if not extracted_text:
+                st.warning("未识别到有效文字，请换更清晰截图，或复制岗位文字到下方粘贴区。")
+            else:
+                if len(uploaded_images) > 1:
+                    st.info("已合并多张截图信息进行分析。")
+
+                with st.spinner("正在根据截图内容生成求职记录..."):
+                    ai_result, error_message = smart_parse_with_deepseek(extracted_text)
+
+                if error_message:
+                    st.error(error_message)
+                else:
+                    fill_form_from_ai_parse(ai_result)
+                    fill_missing_screenshot_fields()
+                    st.success("已完成截图解析，请检查下方表单。部分字段可能需要手动补充。")
+
+with st.container(border=True):
+    st.subheader("智能粘贴解析")
+    st.text_area(
+        "粘贴岗位详情 / HR聊天记录 / 混合文本",
+        height=180,
+        key="smart_raw_text",
+        placeholder="可以粘贴 BOSS 岗位详情、公司介绍、HR 聊天记录，或岗位描述和聊天混合文本。",
+    )
+
+    if st.button("AI解析并生成记录"):
+        if not clean_value(st.session_state.smart_raw_text):
+            st.warning("请先粘贴岗位详情或聊天记录。")
+        else:
+            with st.spinner("正在解析并诊断岗位..."):
+                ai_result, error_message = smart_parse_with_deepseek(st.session_state.smart_raw_text)
 
             if error_message:
                 st.error(error_message)
             else:
                 fill_form_from_ai_parse(ai_result)
-                missing_fields = get_missing_basic_fields()
-                if missing_fields:
-                    st.warning(
-                        "截图文字识别不完整，请补充文字或上传更清晰截图。"
-                        f" 未识别字段：{', '.join(missing_fields)}"
-                    )
-                st.success("截图解析完成，请确认表单后再点击保存记录。")
-
-st.subheader("智能粘贴解析")
-st.text_area(
-    "粘贴岗位详情 / HR聊天记录 / 混合文本",
-    height=180,
-    key="smart_raw_text",
-    placeholder="可以粘贴 BOSS 岗位详情、公司介绍、HR 聊天记录，或岗位描述和聊天混合文本。",
-)
-
-if st.button("AI解析并生成记录"):
-    if not clean_value(st.session_state.smart_raw_text):
-        st.warning("请先粘贴岗位详情或聊天记录。")
-    else:
-        with st.spinner("正在解析并诊断岗位..."):
-            ai_result, error_message = smart_parse_with_deepseek(st.session_state.smart_raw_text)
-
-        if error_message:
-            st.error(error_message)
-        else:
-            fill_form_from_ai_parse(ai_result)
-            st.success("AI解析完成，请确认表单后再点击保存记录。")
+                st.success("AI解析完成，请向下确认表单，然后点击保存记录。")
 
 st.subheader("粘贴岗位原始信息")
 st.text_area(
@@ -1081,7 +1141,7 @@ if st.button("一键解析并填充"):
     fill_form_from_raw_text()
     st.success("解析完成，已填充识别到的字段。")
 
-form_title = "编辑投递记录" if st.session_state.edit_index is not None else "新增投递记录"
+form_title = "编辑投递记录" if st.session_state.edit_index is not None else "确认表单"
 submit_text = "更新记录" if st.session_state.edit_index is not None else "保存记录"
 
 with st.form("job_record_form"):
@@ -1123,15 +1183,42 @@ with st.form("job_record_form"):
         if st.session_state.edit_index is None:
             records_df = pd.concat([records_df, pd.DataFrame([record])], ignore_index=True)
             save_records(records_df)
-            st.success("记录已保存。")
+            st.session_state.last_saved_index = len(records_df) - 1
+            st.success("记录已保存")
+            st.info("如需同步飞书，请点击下方同步按钮")
         else:
+            current_edit_index = st.session_state.edit_index
             record["飞书同步状态"] = clean_value(records_df.loc[st.session_state.edit_index, "飞书同步状态"])
             record["飞书同步时间"] = clean_value(records_df.loc[st.session_state.edit_index, "飞书同步时间"])
             records_df.loc[st.session_state.edit_index, COLUMNS] = [record[column] for column in COLUMNS]
             save_records(records_df)
             st.session_state.edit_index = None
-            st.session_state.success_message = "记录已更新。"
+            st.session_state.last_saved_index = current_edit_index
+            st.session_state.success_message = "记录已保存\n\n如需同步飞书，请点击下方同步按钮"
             st.rerun()
+
+if st.session_state.last_saved_index is not None:
+    records_df_for_sync = read_records()
+    if 0 <= st.session_state.last_saved_index < len(records_df_for_sync):
+        with st.container(border=True):
+            st.subheader("保存与同步")
+            st.success("记录已保存")
+            st.caption("如需同步飞书，请点击下方同步按钮。飞书同步失败不会影响本地保存。")
+
+            if st.button("同步刚保存的记录到飞书"):
+                sync_index = st.session_state.last_saved_index
+                record_to_sync = records_df_for_sync.iloc[sync_index]
+                with st.spinner("正在同步到飞书..."):
+                    error_message = sync_record_to_feishu(record_to_sync)
+
+                if error_message:
+                    st.error(error_message)
+                    st.text(get_feishu_config_status_text())
+                else:
+                    records_df_for_sync.loc[sync_index, "飞书同步状态"] = "已同步"
+                    records_df_for_sync.loc[sync_index, "飞书同步时间"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    save_records(records_df_for_sync)
+                    st.success("同步到飞书成功")
 
 st.subheader("AI 岗位分析结果")
 if any(clean_value(st.session_state[key]) for key in list(AI_FIELD_KEYS.values()) + list(DIAGNOSIS_FIELD_KEYS.values())):
@@ -1287,6 +1374,7 @@ else:
 
                     if error_message:
                         st.error(error_message)
+                        st.text(get_feishu_config_status_text())
                     else:
                         records_df.loc[row_index, "飞书同步状态"] = "已同步"
                         records_df.loc[row_index, "飞书同步时间"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
