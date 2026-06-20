@@ -1,4 +1,5 @@
 from pathlib import Path
+import base64
 import json
 import os
 from datetime import datetime
@@ -12,6 +13,7 @@ from dotenv import load_dotenv
 DATA_DIR = Path("data")
 CSV_FILE = DATA_DIR / "job_records.csv"
 DEEPSEEK_API_URL = "https://api.deepseek.com/chat/completions"
+QWEN_VL_API_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
 FEISHU_TOKEN_URL = "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
 FEISHU_CREATE_RECORD_URL = "https://open.feishu.cn/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records"
 FEISHU_BATCH_DELETE_RECORD_URL = "https://open.feishu.cn/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records/batch_delete"
@@ -51,7 +53,7 @@ COLUMNS = [
     "飞书同步时间",
 ]
 
-STATUS_OPTIONS = ["", "待投递", "已投递", "沟通中", "面试中", "已录用", "已拒绝", "已结束"]
+STATUS_OPTIONS = ["", "待补充", "待投递", "已投递", "沟通中", "面试中", "已录用", "已拒绝", "已结束"]
 FILTER_STATUS_OPTIONS = ["全部", "待投递", "已投递", "沟通中", "面试中", "已录用", "已拒绝", "已结束"]
 AI_MATCH_FILTER_OPTIONS = ["全部", "高", "中", "低"]
 AI_JOB_TYPE_FILTER_OPTIONS = ["全部", "AI产品", "产品助理", "产品运营", "项目助理", "数据分析", "低价值岗位", "未知"]
@@ -495,6 +497,88 @@ def smart_parse_with_deepseek(raw_text):
     return call_deepseek_json(build_smart_parse_prompt(raw_text))
 
 
+def build_qwen_screenshot_prompt():
+    return """
+你是 Boss 直聘截图信息识别助手，只负责读图和提取结构化岗位信息，不做岗位价值分析。
+请从用户上传的 Boss 岗位详情、公司介绍、HR 聊天截图中提取信息。
+如果多张图信息互补，请合并判断。
+请只返回合法 JSON，不要返回 Markdown，不要输出 JSON 之外的解释。
+
+必须返回以下 JSON 字段：
+{
+  "公司名": "",
+  "岗位名": "",
+  "岗位方向": "",
+  "薪资": "",
+  "地点": "",
+  "投递平台": "BOSS直聘",
+  "投递状态": "",
+  "岗位描述": "",
+  "HR聊天记录": "",
+  "识别置信度": "高/中/低",
+  "缺失字段": [],
+  "识别说明": ""
+}
+
+规则：
+- 无法识别的文本字段返回空字符串。
+- 投递平台如果截图来自 Boss 直聘，填 BOSS直聘。
+- 缺失字段必须是数组。
+- 不要臆造公司名和岗位名。
+"""
+
+
+def get_uploaded_image_data_url(uploaded_file):
+    file_bytes = uploaded_file.getvalue()
+    file_type = uploaded_file.type or "image/jpeg"
+    image_base64 = base64.b64encode(file_bytes).decode("utf-8")
+    return f"data:{file_type};base64,{image_base64}"
+
+
+def call_qwen_vision_for_screenshots(uploaded_files):
+    api_key = get_config_value("QWEN_API_KEY")
+    if not api_key:
+        return None, "未配置 Qwen 视觉模型，截图识别不可用。请使用粘贴文本解析，或在 .env / Streamlit Secrets 中配置 QWEN_API_KEY。"
+
+    model = get_config_value("QWEN_VL_MODEL") or "qwen3.6-plus"
+    content = [{"type": "text", "text": build_qwen_screenshot_prompt()}]
+
+    for uploaded_file in uploaded_files:
+        content.append(
+            {
+                "type": "image_url",
+                "image_url": {"url": get_uploaded_image_data_url(uploaded_file)},
+            }
+        )
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": content}],
+        "temperature": 0.1,
+        "response_format": {"type": "json_object"},
+    }
+
+    try:
+        response = requests.post(QWEN_VL_API_URL, headers=headers, json=payload, timeout=60)
+        print(f"Qwen视觉模型 response.status_code: {response.status_code}")
+        print(f"Qwen视觉模型 response.text: {response.text}")
+
+        if response.status_code != 200:
+            return None, f"Qwen视觉模型调用失败：{response.text}"
+
+        result = response.json()
+        content_text = result["choices"][0]["message"]["content"]
+        return parse_ai_response(content_text), ""
+    except requests.exceptions.RequestException as error:
+        return None, f"Qwen视觉模型调用失败：{error}"
+    except (KeyError, IndexError, json.JSONDecodeError) as error:
+        return None, f"Qwen视觉模型返回解析失败：{error}"
+
+
 def save_ai_result_to_session(ai_result):
     st.session_state.ai_match_level = convert_priority_to_match_level(ai_result.get("综合优先级", ""))
     st.session_state.ai_job_type = clean_value(ai_result.get("岗位真实类型判断", ""))
@@ -553,6 +637,28 @@ def fill_form_from_ai_parse(ai_result):
         st.session_state.priority = ""
 
     save_ai_result_to_session(ai_result)
+
+
+def fill_form_from_qwen_result(qwen_result):
+    field_mapping = {
+        "公司名": "company_name",
+        "岗位名": "job_title",
+        "岗位方向": "job_direction",
+        "薪资": "salary",
+        "地点": "location",
+        "投递平台": "platform",
+        "投递状态": "status",
+    }
+
+    for result_key, session_key in field_mapping.items():
+        value = clean_value(qwen_result.get(result_key, ""))
+        st.session_state[session_key] = value or "待补充"
+
+    st.session_state.notes = clean_value(qwen_result.get("岗位描述", "")) or "待补充"
+    st.session_state.chat_text = clean_value(qwen_result.get("HR聊天记录", ""))
+
+    if not clean_value(st.session_state.status) or st.session_state.status not in STATUS_OPTIONS:
+        st.session_state.status = "待补充" if "待补充" in STATUS_OPTIONS else ""
 
 
 def convert_overall_priority_to_record_priority(priority):
@@ -1082,33 +1188,65 @@ with st.container(border=True):
         accept_multiple_files=True,
     )
 
-    if st.button("AI识别截图并生成记录"):
+    if uploaded_images:
+        st.caption("图片预览")
+        preview_columns = st.columns(min(len(uploaded_images), 4))
+        for index, uploaded_image in enumerate(uploaded_images):
+            with preview_columns[index % len(preview_columns)]:
+                st.image(uploaded_image, caption=uploaded_image.name, use_container_width=True)
+
+    if st.button("AI读取截图并生成记录"):
         if not uploaded_images:
             st.warning("请先上传截图。")
         elif len(uploaded_images) > 8:
             st.warning("最多上传 8 张截图，请减少截图数量后重试。")
         else:
-            with st.spinner("正在识别截图文字..."):
-                extracted_text, ocr_errors = extract_text_from_uploaded_images(uploaded_images)
+            with st.spinner("正在调用视觉模型读取截图..."):
+                qwen_result, qwen_error = call_qwen_vision_for_screenshots(uploaded_images)
 
-            if not extracted_text:
-                st.warning("未识别到有效文字，请换更清晰截图，或复制岗位文字到下方粘贴区。")
-            else:
+            if qwen_result:
+                fill_form_from_qwen_result(qwen_result)
+                with st.expander("视觉模型识别结果", expanded=False):
+                    st.json(qwen_result)
                 if len(uploaded_images) > 1:
                     st.info("已合并多张截图信息进行分析。")
+                st.success("图片读取完成，请检查下方表单。")
+                st.info("如需岗位价值判断，请继续点击下方“AI岗位深度诊断”。")
+            elif qwen_error.startswith("未配置 Qwen 视觉模型"):
+                st.warning(qwen_error)
+            else:
+                st.warning("视觉模型读取失败，正在尝试备用 OCR。")
+                with st.spinner("正在使用备用 OCR 识别截图文字..."):
+                    extracted_text, ocr_errors = extract_text_from_uploaded_images(uploaded_images)
 
-                with st.spinner("正在根据截图内容生成求职记录..."):
-                    ai_result, error_message = smart_parse_with_deepseek(extracted_text)
+                with st.expander("备用 OCR 识别到的原始文字", expanded=False):
+                    st.text_area(
+                        "OCR 原始文字",
+                        value=extracted_text or "未识别到文字",
+                        height=220,
+                        disabled=True,
+                    )
 
-                if error_message:
-                    st.error(error_message)
+                if not extracted_text:
+                    st.error("图片理解失败，请尝试粘贴岗位文字。")
                 else:
-                    fill_form_from_ai_parse(ai_result)
-                    fill_missing_screenshot_fields()
-                    st.success("已完成截图解析，请检查下方表单。部分字段可能需要手动补充。")
+                    if len(uploaded_images) > 1:
+                        st.info("已合并多张截图信息进行分析。")
+
+                    with st.spinner("正在根据 OCR 文字生成求职记录..."):
+                        ai_result, error_message = smart_parse_with_deepseek(extracted_text)
+
+                    if error_message:
+                        st.error(error_message)
+                    else:
+                        fill_form_from_ai_parse(ai_result)
+                        fill_missing_screenshot_fields()
+                        st.success("图片读取完成，请检查下方表单。")
+                        st.info("如需岗位价值判断，请继续点击下方“AI岗位深度诊断”。")
 
 with st.container(border=True):
     st.subheader("智能粘贴解析")
+    st.caption("截图识别不稳定时，粘贴岗位文字是最稳方式。")
     st.text_area(
         "粘贴岗位详情 / HR聊天记录 / 混合文本",
         height=180,
@@ -1163,7 +1301,7 @@ with st.form("job_record_form"):
         st.text_area("备注", height=120, key="notes")
         st.text_area("聊天记录文本", height=180, key="chat_text")
 
-    ai_submitted = st.form_submit_button("AI 分析岗位")
+    ai_submitted = st.form_submit_button("AI岗位深度诊断")
     submitted = st.form_submit_button(submit_text)
 
     if ai_submitted:

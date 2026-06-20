@@ -25,7 +25,7 @@ AI 求职投递管理与沟通分析系统。
 - 支持为岗位设置优先级，并按优先级和 AI 匹配度排序展示。
 - 支持将单条已保存记录同步到飞书多维表格，并记录同步状态和同步时间。
 - 支持“智能粘贴解析”，从岗位详情、公司介绍、HR 聊天记录或混合文本中自动生成结构化求职记录。
-- 支持上传岗位页、公司介绍页或 HR 聊天截图，识别截图文字后生成结构化求职记录。
+- 支持上传岗位页、公司介绍页或 HR 聊天截图，调用阿里云百炼 Qwen 视觉模型读取图片并生成结构化求职记录。
 - 支持面向产品、AI 产品、产品运营、项目助理实习方向的深度诊断，输出产品相关度、AI/数据/SaaS 相关度、简历增值程度、低价值杂活风险、成长路径清晰度、综合优先级、HR 追问问题、面试表达建议和建议回复话术。
 
 ## 一键解析规则
@@ -52,6 +52,7 @@ AI 求职投递管理与沟通分析系统。
 - python-dotenv
 - Pillow
 - pytesseract
+- 阿里云百炼 Qwen 视觉模型
 - DeepSeek API
 - 飞书开放平台 API
 - CSV 本地文件存储
@@ -72,6 +73,8 @@ pip install -r requirements.txt
 
 ```env
 DEEPSEEK_API_KEY=your_api_key_here
+QWEN_API_KEY=your_qwen_api_key_here
+QWEN_VL_MODEL=qwen3.6-plus
 FEISHU_APP_ID=your_app_id_here
 FEISHU_APP_SECRET=your_app_secret_here
 FEISHU_APP_TOKEN=your_bitable_app_token_here
@@ -146,15 +149,23 @@ DeepSeek AI 解析和分析需要：
 
 - `DEEPSEEK_API_KEY`
 
+截图识别需要：
+
+- `QWEN_API_KEY`
+- `QWEN_VL_MODEL`
+
+`QWEN_API_KEY` 是阿里云百炼账号级调用凭证，不是某个模型专属 Key。`QWEN_VL_MODEL` 未配置时，应用默认使用 `qwen3.6-plus`。
+
 部署后测试截图上传：
 
 1. 用手机浏览器打开 Streamlit Cloud 生成的公开网址。
 2. 在 Boss 直聘手机端截取岗位页、公司介绍页或 HR 聊天页。
 3. 回到 BossPilot 页面，进入“截图上传解析”。
-4. 上传 1-3 张截图。
-5. 点击“AI识别截图并生成记录”。
+4. 上传 1-8 张截图，建议 2-5 张。
+5. 点击“AI读取截图并生成记录”。
 6. 检查表单是否被自动填充。
-7. 确认无误后点击“保存记录”。
+7. 如需岗位价值判断，点击“AI岗位深度诊断”。
+8. 确认无误后点击“保存记录”。
 
 注意：Streamlit Cloud 的本地文件系统不适合作为长期数据库。`data/job_records.csv` 适合 Web MVP 测试，正式长期使用建议以飞书多维表格或数据库作为主存储。
 
