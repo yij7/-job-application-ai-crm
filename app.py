@@ -806,11 +806,12 @@ def get_uploaded_image_data_url(uploaded_file, max_side=1280, quality=85):
     return f"data:{file_type};base64,{image_base64}", image_info
 
 
-def build_qwen_debug_info(model, api_key):
+def build_qwen_debug_info(model, api_key, recognition_mode="快速识别"):
     return {
         "QWEN_VL_MODEL 当前值": model,
         "是否读取到 QWEN_API_KEY": bool(api_key),
         "请求接口 base_url": QWEN_VL_API_URL,
+        "识别模式": recognition_mode,
         "每张截图识别状态": [],
         "每张截图识别结果": [],
         "每张截图调试信息": [],
@@ -823,7 +824,16 @@ def build_qwen_debug_info(model, api_key):
     }
 
 
-def call_qwen_vision_for_single_screenshot(uploaded_file, image_index, headers, model, previous_results):
+def call_qwen_vision_for_single_screenshot(
+    uploaded_file,
+    image_index,
+    headers,
+    model,
+    previous_results,
+    max_side=1280,
+    quality=80,
+    timeout=150,
+):
     debug_item = {
         "图片序号": image_index,
         "文件名": uploaded_file.name,
@@ -844,26 +854,12 @@ def call_qwen_vision_for_single_screenshot(uploaded_file, image_index, headers, 
 
     attempts = [
         {
-            "名称": "第一次",
-            "max_side": 1280,
-            "quality": 85,
-            "timeout": 120,
+            "名称": "视觉识别",
+            "max_side": max_side,
+            "quality": quality,
+            "timeout": timeout,
             "prompt": build_qwen_screenshot_prompt(image_index),
-        },
-        {
-            "名称": "第二次",
-            "max_side": 1024,
-            "quality": 80,
-            "timeout": 180,
-            "prompt": build_qwen_screenshot_prompt(image_index),
-        },
-        {
-            "名称": "第三次",
-            "max_side": 1024,
-            "quality": 80,
-            "timeout": 180,
-            "prompt": build_qwen_fallback_prompt(image_index),
-        },
+        }
     ]
 
     for attempt_index, attempt in enumerate(attempts, start=1):
@@ -941,10 +937,10 @@ def call_qwen_vision_for_single_screenshot(uploaded_file, image_index, headers, 
             debug_item["排查建议"] = image_result["失败原因"]
             debug_item["尝试记录"].append(attempt_debug)
         except requests.exceptions.Timeout as error:
-            attempt_debug["失败原因"] = "模型超时"
+            attempt_debug["失败原因"] = "该截图识别超时，已跳过。"
             debug_item["Python 异常类型"] = type(error).__name__
             debug_item["Python 异常信息"] = str(error)
-            debug_item["排查建议"] = "模型超时，已继续重试或识别下一张。"
+            debug_item["排查建议"] = "该截图识别超时，已跳过。"
             debug_item["尝试记录"].append(attempt_debug)
         except requests.exceptions.RequestException as error:
             attempt_debug["失败原因"] = "API报错"
@@ -1248,10 +1244,10 @@ def merge_qwen_screenshot_results(image_results):
     return final_result
 
 
-def call_qwen_vision_for_screenshots(uploaded_files):
+def call_qwen_vision_for_screenshots(uploaded_files, recognition_mode="快速识别", progress_placeholder=None):
     api_key = get_config_value("QWEN_API_KEY")
     model = get_config_value("QWEN_VL_MODEL") or "qwen3.6-plus"
-    debug_info = build_qwen_debug_info(model, api_key)
+    debug_info = build_qwen_debug_info(model, api_key, recognition_mode)
 
     if not api_key:
         debug_info["排查建议"] = "请在 .env / Streamlit Secrets 中配置 QWEN_API_KEY。"
@@ -1262,14 +1258,32 @@ def call_qwen_vision_for_screenshots(uploaded_files):
         "Content-Type": "application/json",
     }
 
+    if recognition_mode == "快速识别":
+        files_to_process = uploaded_files[:3]
+        max_side = 1024
+        quality = 75
+        timeout = 90
+    else:
+        files_to_process = uploaded_files[:10]
+        max_side = 1280
+        quality = 80
+        timeout = 150
+
     successful_results = []
-    for image_index, uploaded_file in enumerate(uploaded_files, start=1):
+    total_images = len(files_to_process)
+    for image_index, uploaded_file in enumerate(files_to_process, start=1):
+        if progress_placeholder:
+            progress_placeholder.info(f"正在识别第 {image_index} / {total_images} 张截图")
+
         image_result, image_debug = call_qwen_vision_for_single_screenshot(
             uploaded_file,
             image_index,
             headers,
             model,
             successful_results,
+            max_side=max_side,
+            quality=quality,
+            timeout=timeout,
         )
         debug_info["每张截图识别状态"].append(f"第{image_index}张：{image_debug['最终状态']}")
         debug_info["每张截图识别结果"].append(image_result or image_debug)
@@ -1277,13 +1291,19 @@ def call_qwen_vision_for_screenshots(uploaded_files):
         if image_result:
             successful_results.append(image_result)
 
+    if recognition_mode == "快速识别" and len(uploaded_files) > len(files_to_process):
+        for skipped_index in range(len(files_to_process) + 1, len(uploaded_files) + 1):
+            debug_info["每张截图识别状态"].append(
+                f"第{skipped_index}张：快速识别模式未调用视觉模型"
+            )
+
     if not successful_results:
         debug_info["排查建议"] = "所有图片视觉模型识别均失败，已准备进入备用 OCR。"
         return None, "Qwen视觉模型调用失败。", debug_info
 
     merged_result = merge_qwen_screenshot_results(successful_results)
     debug_info["合并后的岗位信息"] = merged_result
-    if len(successful_results) < len(uploaded_files):
+    if len(successful_results) < len(files_to_process):
         return merged_result, "部分截图未提取到有效信息，但已根据成功识别的截图生成记录。", debug_info
 
     return merged_result, "", debug_info
@@ -1931,15 +1951,30 @@ st.markdown(
 
 with st.container(border=True):
     st.subheader("截图上传")
-    st.caption("建议上传 2–5 张 Boss 岗位截图 / 公司介绍 / HR 聊天截图，最多 8 张。")
+    st.caption("建议上传 2–5 张 Boss 岗位截图，最多 10 张。")
     st.info("手机端建议先在相册中整理好截图，再一次性选择上传。")
     uploaded_images = st.file_uploader(
         "上传截图",
         type=["png", "jpg", "jpeg"],
         accept_multiple_files=True,
     )
+    recognition_mode = st.radio(
+        "识别模式",
+        ["快速识别", "完整识别"],
+        index=0,
+        horizontal=True,
+    )
+    if recognition_mode == "快速识别":
+        st.caption("快速识别模式下，建议把岗位详情图、公司信息图、关键HR聊天图放在前 3 张。")
+    else:
+        st.caption("完整识别会处理更多截图，耗时较长，请耐心等待。")
 
     if uploaded_images:
+        st.success(f"上传成功 {len(uploaded_images)} 张截图")
+        st.caption(f"当前识别模式：{recognition_mode}")
+        st.caption("已压缩图片以提升识别速度。")
+        if recognition_mode == "快速识别" and len(uploaded_images) > 3:
+            st.info("快速识别模式下，系统将优先分析前 3 张截图。其余截图不会调用视觉模型。")
         st.caption("图片预览")
         preview_columns = st.columns(min(len(uploaded_images), 4))
         for index, uploaded_image in enumerate(uploaded_images):
@@ -1949,11 +1984,17 @@ with st.container(border=True):
     if st.button("AI读取截图并生成记录"):
         if not uploaded_images:
             st.warning("请先上传截图。")
-        elif len(uploaded_images) > 8:
-            st.warning("最多上传 8 张截图，请减少截图数量后重试。")
+        elif len(uploaded_images) > 10:
+            st.warning("最多上传 10 张截图，请减少后重新上传。")
         else:
+            progress_placeholder = st.empty()
             with st.spinner("正在逐张调用视觉模型读取截图..."):
-                qwen_result, qwen_error, qwen_debug_info = call_qwen_vision_for_screenshots(uploaded_images)
+                qwen_result, qwen_error, qwen_debug_info = call_qwen_vision_for_screenshots(
+                    uploaded_images,
+                    recognition_mode=recognition_mode,
+                    progress_placeholder=progress_placeholder,
+                )
+            progress_placeholder.empty()
 
             if qwen_result:
                 fill_form_from_qwen_result(qwen_result)
@@ -1969,7 +2010,10 @@ with st.container(border=True):
                     st.warning(qwen_error)
                 if len(uploaded_images) > 1:
                     st.info("已逐张识别多张截图，并合并为一份岗位记录。")
-                st.success("已完成多张截图识别并合并，请检查下方表单。")
+                if recognition_mode == "快速识别":
+                    st.success("快速识别完成，如信息不完整，可切换完整识别或使用粘贴文本补充。")
+                else:
+                    st.success("已完成多张截图识别并合并，请检查下方表单。")
                 st.info("如需岗位价值判断，请继续点击下方“AI岗位深度诊断”。")
             elif qwen_error.startswith("未配置 Qwen 视觉模型"):
                 st.warning(qwen_error)
