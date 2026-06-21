@@ -5,6 +5,7 @@ import json
 import os
 import time
 from datetime import datetime
+from urllib.parse import urlparse
 
 import pandas as pd
 import requests
@@ -14,6 +15,7 @@ from dotenv import load_dotenv
 
 DATA_DIR = Path("data")
 CSV_FILE = DATA_DIR / "job_records.csv"
+EXTENSION_SESSION_DIR = DATA_DIR / "extension_sessions"
 DEEPSEEK_API_URL = "https://api.deepseek.com/chat/completions"
 QWEN_VL_API_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
 FEISHU_TOKEN_URL = "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
@@ -29,9 +31,12 @@ COLUMNS = [
     "地点",
     "投递平台",
     "投递状态",
+    "岗位链接",
     "备注",
     "聊天记录文本",
+    "创建时间",
     "岗位优先级",
+    "岗位优先级分值",
     "AI岗位匹配度",
     "AI岗位类型",
     "AI风险点",
@@ -128,6 +133,7 @@ AI_JOB_TYPE_KEYWORDS = {
 AI_JOB_TYPE_SEARCH_COLUMNS = ["AI岗位类型", "岗位真实类型判断", "岗位名", "岗位方向", "备注", "判断理由"]
 PRIORITY_OPTIONS = ["待评估", "高", "中", "低", "观察"]
 PRIORITY_SORT_ORDER = {"高": 0, "中": 1, "低": 2, "观察": 3, "待评估": 4}
+PRIORITY_SCORE_MAP = {"高": 5, "中": 4, "观察": 3, "待评估": 2, "低": 1}
 AI_MATCH_SORT_ORDER = {"高": 0, "中": 1, "低": 2}
 FEISHU_SYNC_FIELDS = [
     "公司名",
@@ -137,7 +143,9 @@ FEISHU_SYNC_FIELDS = [
     "地点",
     "投递平台",
     "投递状态",
+    "岗位链接",
     "岗位优先级",
+    "岗位优先级分值",
     "备注",
     "聊天记录文本",
     "产品相关度",
@@ -162,6 +170,7 @@ FIELD_KEYS = {
     "地点": "location",
     "投递平台": "platform",
     "投递状态": "status",
+    "岗位链接": "job_url",
     "岗位优先级": "priority",
     "备注": "notes",
     "聊天记录文本": "chat_text",
@@ -271,6 +280,21 @@ def normalize_priority(priority):
     return priority
 
 
+def get_priority_score(priority):
+    return PRIORITY_SCORE_MAP.get(normalize_priority(priority), 2)
+
+
+def ensure_priority_fields(records_df):
+    if "岗位优先级" not in records_df.columns:
+        records_df["岗位优先级"] = "待评估"
+    records_df["岗位优先级"] = records_df["岗位优先级"].map(normalize_priority).astype(object)
+    records_df["岗位优先级分值"] = records_df["岗位优先级"].map(get_priority_score).map(str).astype(object)
+    if "创建时间" not in records_df.columns:
+        records_df["创建时间"] = ""
+    records_df["创建时间"] = records_df["创建时间"].map(safe_str).astype(object)
+    return records_df
+
+
 def safe_score(value):
     value = safe_str(value)
     try:
@@ -296,13 +320,11 @@ def generate_priority_from_ai_result(ai_result):
 
 
 def ensure_ai_columns_are_strings(records_df):
+    records_df = ensure_priority_fields(records_df)
     for column in ALL_AI_COLUMNS:
         if column not in records_df.columns:
             records_df[column] = ""
         records_df[column] = records_df[column].map(safe_str).astype(object)
-    if "岗位优先级" not in records_df.columns:
-        records_df["岗位优先级"] = "待评估"
-    records_df["岗位优先级"] = records_df["岗位优先级"].map(normalize_priority).astype(object)
     return records_df
 
 
@@ -326,9 +348,12 @@ def get_form_record():
         "地点": clean_value(st.session_state.location),
         "投递平台": clean_value(st.session_state.platform),
         "投递状态": clean_value(st.session_state.status),
+        "岗位链接": clean_value(st.session_state.job_url),
         "备注": clean_value(st.session_state.notes),
         "聊天记录文本": clean_value(st.session_state.chat_text),
+        "创建时间": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "岗位优先级": normalize_priority(st.session_state.priority),
+        "岗位优先级分值": str(get_priority_score(st.session_state.priority)),
         "AI岗位匹配度": clean_value(st.session_state.ai_match_level),
         "AI岗位类型": clean_value(st.session_state.ai_job_type),
         "AI风险点": clean_value(st.session_state.ai_risks),
@@ -1382,7 +1407,7 @@ def convert_priority_to_match_level(priority):
     return ""
 
 
-def fill_form_from_ai_parse(ai_result):
+def fill_form_from_ai_parse(ai_result, include_ai=True):
     for column, key in FIELD_KEYS.items():
         st.session_state[key] = clean_value(ai_result.get(column, ""))
 
@@ -1398,7 +1423,10 @@ def fill_form_from_ai_parse(ai_result):
     if st.session_state.priority not in PRIORITY_OPTIONS:
         st.session_state.priority = "待评估"
 
-    save_ai_result_to_session(ai_result)
+    if include_ai:
+        save_ai_result_to_session(ai_result)
+    else:
+        clear_ai_result_from_session()
 
 
 def fill_form_from_qwen_result(qwen_result):
@@ -1538,10 +1566,16 @@ def match_ai_job_type_filter(row, ai_job_type_filter):
 
 def sort_records(records_df):
     sorted_df = records_df.copy()
-    sorted_df["_priority_sort"] = sorted_df["岗位优先级"].map(PRIORITY_SORT_ORDER).fillna(99)
-    sorted_df["_ai_match_sort"] = sorted_df["AI岗位匹配度"].map(AI_MATCH_SORT_ORDER).fillna(99)
-    sorted_df = sorted_df.sort_values(by=["_priority_sort", "_ai_match_sort"], kind="stable")
-    return sorted_df.drop(columns=["_priority_sort", "_ai_match_sort"])
+    sorted_df = ensure_priority_fields(sorted_df)
+    sorted_df["_priority_score_sort"] = pd.to_numeric(sorted_df["岗位优先级分值"], errors="coerce").fillna(2)
+    sorted_df["_created_time_sort"] = pd.to_datetime(sorted_df["创建时间"], errors="coerce")
+    sorted_df["_row_order_sort"] = sorted_df.index
+    sorted_df = sorted_df.sort_values(
+        by=["_priority_score_sort", "_created_time_sort", "_row_order_sort"],
+        ascending=[False, False, False],
+        kind="stable",
+    )
+    return sorted_df.drop(columns=["_priority_score_sort", "_created_time_sort", "_row_order_sort"])
 
 
 def get_feishu_config():
@@ -1621,8 +1655,9 @@ def get_feishu_tenant_access_token(config):
 
 
 def build_feishu_fields(record):
+    normalized_priority = normalize_priority(record.get("岗位优先级", ""))
     return {
-        column: clean_value(record.get(column, ""))
+        column: str(get_priority_score(normalized_priority)) if column == "岗位优先级分值" else clean_value(record.get(column, ""))
         for column in FEISHU_SYNC_FIELDS
     }
 
@@ -1700,6 +1735,494 @@ def sync_record_to_feishu(record):
         return f"飞书同步失败：网络请求异常，请稍后重试。本地保存不受影响。{error}"
     except (KeyError, RuntimeError) as error:
         return str(error)
+
+
+def get_query_param(name):
+    value = st.query_params.get(name, "")
+    if isinstance(value, list):
+        return clean_value(value[0] if value else "")
+    return clean_value(value)
+
+
+def append_source_to_notes(notes, page_title, page_url):
+    note_parts = [clean_value(notes)]
+    if page_title:
+        note_parts.append(f"来源页面：{page_title}")
+    if page_url:
+        note_parts.append(f"岗位链接：{page_url}")
+    return "\n".join(part for part in note_parts if part)
+
+
+def is_duplicate_extension_record(records_df, record):
+    page_url = clean_value(record.get("岗位链接", ""))
+    company = clean_value(record.get("公司名", ""))
+    job_title = clean_value(record.get("岗位名", ""))
+
+    if page_url and "岗位链接" in records_df.columns:
+        if records_df["岗位链接"].astype(str).map(clean_value).eq(page_url).any():
+            return True
+
+    if company and job_title:
+        duplicate_mask = (
+            records_df["公司名"].astype(str).map(clean_value).eq(company)
+            & records_df["岗位名"].astype(str).map(clean_value).eq(job_title)
+        )
+        return duplicate_mask.any()
+
+    return False
+
+
+def handle_extension_import():
+    if get_query_param("source") != "extension":
+        return
+
+    raw_text = get_query_param("raw_text")
+    page_title = get_query_param("page_title")
+    page_url = get_query_param("page_url")
+    import_key = f"{page_url}|{len(raw_text)}|{raw_text[:80]}"
+
+    if not raw_text:
+        st.session_state.extension_import_status = {
+            "title": "Boss 网页岗位导入失败",
+            "岗位": "未识别",
+            "公司": "未识别",
+            "AI分析": "未执行",
+            "本地保存": "失败：未收到网页文本",
+            "飞书同步": "未执行",
+        }
+        return
+
+    if st.session_state.get("handled_extension_import_key") == import_key:
+        return
+
+    st.session_state.handled_extension_import_key = import_key
+    status = {
+        "title": "Boss 网页岗位已导入",
+        "岗位": "待解析",
+        "公司": "待解析",
+        "AI分析": "未执行",
+        "本地保存": "未完成",
+        "飞书同步": "未执行",
+    }
+
+    ai_result, parse_error = smart_parse_with_deepseek(
+        f"页面标题：{page_title}\n页面链接：{page_url}\n\n网页文本：\n{raw_text}"
+    )
+
+    if parse_error:
+        status["title"] = "Boss 网页岗位导入失败"
+        status["AI分析"] = "失败：解析未完成"
+        status["本地保存"] = "未保存，请检查网页文本或改用粘贴解析"
+        st.session_state.extension_import_status = status
+        return
+
+    fill_form_from_ai_parse(ai_result)
+    st.session_state.job_url = page_url
+    st.session_state.notes = append_source_to_notes(st.session_state.notes, page_title, page_url)
+    st.session_state.platform = st.session_state.platform or "BOSS直聘"
+
+    base_record = get_form_record()
+    diagnosis_result, diagnosis_error = analyze_job_with_deepseek(base_record)
+    if diagnosis_error:
+        status["AI分析"] = f"失败：{diagnosis_error}"
+    else:
+        save_ai_result_to_session(diagnosis_result)
+        st.session_state.priority = generate_priority_from_ai_result(diagnosis_result)
+        status["AI分析"] = "已完成"
+
+    record = get_form_record()
+    record["岗位链接"] = page_url
+    record["备注"] = append_source_to_notes(record.get("备注", ""), page_title, page_url)
+    status["岗位"] = clean_value(record.get("岗位名", "")) or "未识别"
+    status["公司"] = clean_value(record.get("公司名", "")) or "未识别"
+
+    records_df = read_records()
+    if is_duplicate_extension_record(records_df, record):
+        status["本地保存"] = "该岗位已存在，未重复保存"
+        st.session_state.extension_import_status = status
+        return
+
+    records_df = pd.concat([records_df, pd.DataFrame([record])], ignore_index=True)
+    save_records(records_df)
+    saved_index = len(records_df) - 1
+    st.session_state.last_saved_index = saved_index
+    status["本地保存"] = "已完成"
+
+    config = get_feishu_config()
+    if check_feishu_config(config):
+        status["飞书同步"] = "未配置，已跳过"
+    else:
+        sync_error = sync_record_to_feishu(record)
+        if sync_error:
+            records_df = read_records()
+            records_df.at[saved_index, "飞书同步状态"] = "同步失败"
+            save_records(records_df)
+            status["飞书同步"] = f"失败：{sync_error}"
+        else:
+            records_df = read_records()
+            records_df.at[saved_index, "飞书同步状态"] = "已同步"
+            records_df.at[saved_index, "飞书同步时间"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            save_records(records_df)
+            status["飞书同步"] = "已完成"
+
+    st.session_state.extension_import_status = status
+
+
+def is_boss_page_url(page_url):
+    try:
+        hostname = urlparse(clean_value(page_url)).hostname or ""
+    except ValueError:
+        return False
+    return hostname == "zhipin.com" or hostname.endswith(".zhipin.com")
+
+
+def guess_extension_page_type(page):
+    page_type = clean_value(page.get("page_type", ""))
+    valid_types = ["岗位详情页", "岗位列表页", "公司页", "聊天页", "地图地点页", "其他"]
+    if page_type in valid_types:
+        return page_type
+
+    page_url = clean_value(page.get("page_url", ""))
+    text = " ".join(
+        [
+            clean_value(page.get("page_title", "")),
+            page_url,
+            clean_value(page.get("raw_text", "")),
+        ]
+    )
+    lower_url = page_url.lower()
+
+    if any(keyword in text for keyword in ["聊天", "沟通", "消息", "立即沟通"]) or "chat" in lower_url:
+        return "聊天页"
+    if any(keyword in text for keyword in ["公司介绍", "公司信息", "企业信息", "融资", "规模"]) or "gongsi" in lower_url:
+        return "公司页"
+    if any(keyword in text for keyword in ["职位描述", "岗位职责", "任职要求", "职位详情", "岗位详情", "薪资"]):
+        return "岗位详情页"
+    if any(keyword in text for keyword in ["职位列表", "推荐职位", "搜索结果", "筛选"]):
+        return "岗位列表页"
+    if any(keyword in text for keyword in ["地图", "地址", "距离", "通勤"]):
+        return "地图地点页"
+    return "其他"
+
+
+def normalize_extension_page(page):
+    return {
+        "page_title": clean_value(page.get("page_title", "")),
+        "page_url": clean_value(page.get("page_url", "")),
+        "raw_text": clean_value(page.get("raw_text", "")),
+        "captured_at": clean_value(page.get("captured_at", "")),
+        "page_type": guess_extension_page_type(page),
+        "source": clean_value(page.get("source", "boss_chrome_extension_session")),
+    }
+
+
+def compact_session_text(text):
+    return " ".join(clean_value(text).split())
+
+
+def deduplicate_extension_pages(pages):
+    deduplicated_pages = []
+    for raw_page in pages:
+        page = normalize_extension_page(raw_page)
+        if page["page_url"] and not is_boss_page_url(page["page_url"]):
+            continue
+        if not page["raw_text"]:
+            continue
+
+        same_url_index = next(
+            (
+                index
+                for index, item in enumerate(deduplicated_pages)
+                if item["page_url"] and item["page_url"] == page["page_url"]
+            ),
+            None,
+        )
+        if same_url_index is not None:
+            if len(page["raw_text"]) >= len(deduplicated_pages[same_url_index]["raw_text"]):
+                deduplicated_pages[same_url_index] = page
+            continue
+
+        page_signature = (
+            compact_session_text(page["page_title"]),
+            compact_session_text(page["raw_text"])[:300],
+        )
+        similar_index = next(
+            (
+                index
+                for index, item in enumerate(deduplicated_pages)
+                if (
+                    compact_session_text(item["page_title"]),
+                    compact_session_text(item["raw_text"])[:300],
+                )
+                == page_signature
+            ),
+            None,
+        )
+        if similar_index is not None:
+            if len(page["raw_text"]) >= len(deduplicated_pages[similar_index]["raw_text"]):
+                deduplicated_pages[similar_index] = page
+            continue
+
+        deduplicated_pages.append(page)
+
+    return deduplicated_pages
+
+
+def clean_extension_page_text(raw_text, max_length=10000):
+    cleaned_lines = []
+    seen_lines = set()
+    current_length = 0
+    for line in clean_value(raw_text).splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        line_key = compact_session_text(line)
+        if line_key in seen_lines and len(line_key) < 80:
+            continue
+        seen_lines.add(line_key)
+        cleaned_lines.append(line)
+        current_length += len(line) + 1
+        if current_length >= max_length:
+            break
+    return "\n".join(cleaned_lines)[:max_length]
+
+
+def format_extension_page_context(page, max_length=10000):
+    return (
+        f"页面标题：{page['page_title']}\n"
+        f"页面链接：{page['page_url']}\n"
+        f"页面类型：{page['page_type']}\n"
+        f"采集时间：{page['captured_at']}\n\n"
+        f"页面可见文本：\n{clean_extension_page_text(page['raw_text'], max_length=max_length)}"
+    )
+
+
+def build_session_parse_text(candidate_page, support_pages):
+    context_parts = [format_extension_page_context(candidate_page, max_length=9000)]
+    for support_page in support_pages[:3]:
+        if support_page["page_url"] == candidate_page["page_url"]:
+            continue
+        context_parts.append(format_extension_page_context(support_page, max_length=1800))
+    return "\n\n---\n\n".join(context_parts)[:12000]
+
+
+def match_chat_pages_to_record(chat_pages, record):
+    matched_pages = []
+    unmatched_pages = []
+    company = clean_value(record.get("公司名", ""))
+    job_title = clean_value(record.get("岗位名", ""))
+
+    for chat_page in chat_pages:
+        search_text = f"{chat_page['page_title']}\n{chat_page['raw_text']}"
+        if (company and company in search_text) or (job_title and job_title in search_text):
+            matched_pages.append(chat_page)
+        else:
+            unmatched_pages.append(chat_page)
+
+    return matched_pages, unmatched_pages
+
+
+def append_chat_pages_to_record(record, chat_pages):
+    chat_parts = [clean_value(record.get("聊天记录文本", ""))]
+    for chat_page in chat_pages:
+        chat_text = clean_extension_page_text(chat_page["raw_text"], max_length=3000)
+        if chat_text:
+            chat_parts.append(
+                f"来源页面：{chat_page['page_title']}\n来源链接：{chat_page['page_url']}\n{chat_text}"
+            )
+    record["聊天记录文本"] = "\n\n".join(part for part in chat_parts if part)
+    return record
+
+
+def build_record_from_ai_parse(ai_result, page_title, page_url):
+    record = {column: "" for column in COLUMNS}
+    for column in FIELD_KEYS:
+        record[column] = safe_str(ai_result.get(column, ""))
+
+    record["岗位链接"] = page_url or record.get("岗位链接", "")
+    record["投递平台"] = record.get("投递平台", "") or "BOSS直聘"
+    record["备注"] = append_source_to_notes(record.get("备注", ""), page_title, page_url)
+    record["创建时间"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    parsed_priority = (
+        ai_result.get("岗位优先级", "")
+        or generate_priority_from_ai_result(ai_result)
+        or convert_overall_priority_to_record_priority(ai_result.get("综合优先级", ""))
+    )
+    record["岗位优先级"] = normalize_priority(parsed_priority)
+    record["岗位优先级分值"] = str(get_priority_score(record["岗位优先级"]))
+
+    for column in DIAGNOSIS_FIELD_KEYS:
+        record[column] = safe_str(clean_ai_value(ai_result.get(column, "")))
+
+    return record
+
+
+def apply_diagnosis_to_record(record, diagnosis_result):
+    ai_record = get_ai_record_from_result(diagnosis_result)
+    for column, value in ai_record.items():
+        record[column] = safe_str(value)
+
+    generated_priority = generate_priority_from_ai_result(diagnosis_result)
+    record["岗位优先级"] = normalize_priority(diagnosis_result.get("岗位优先级", "") or generated_priority)
+    record["岗位优先级分值"] = str(get_priority_score(record["岗位优先级"]))
+    return record
+
+
+def is_duplicate_job_record(records_df, record):
+    page_url = clean_value(record.get("岗位链接", ""))
+    if page_url and "岗位链接" in records_df.columns:
+        if records_df["岗位链接"].astype(str).map(clean_value).eq(page_url).any():
+            return True
+
+    company = clean_value(record.get("公司名", ""))
+    job_title = clean_value(record.get("岗位名", ""))
+    salary = clean_value(record.get("薪资", ""))
+    location = clean_value(record.get("地点", ""))
+    if company and job_title:
+        duplicate_mask = (
+            records_df["公司名"].astype(str).map(clean_value).eq(company)
+            & records_df["岗位名"].astype(str).map(clean_value).eq(job_title)
+            & records_df["薪资"].astype(str).map(clean_value).eq(salary)
+            & records_df["地点"].astype(str).map(clean_value).eq(location)
+        )
+        return duplicate_mask.any()
+    return False
+
+
+def list_extension_session_files():
+    if not EXTENSION_SESSION_DIR.exists():
+        return []
+    return sorted(
+        EXTENSION_SESSION_DIR.glob("*.json"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+
+
+def load_extension_session_file(session_path):
+    try:
+        return json.loads(Path(session_path).read_text(encoding="utf-8")), ""
+    except (OSError, json.JSONDecodeError) as error:
+        return None, f"读取会话文件失败：{error}"
+
+
+def summarize_extension_session_file(session_path):
+    data, error_message = load_extension_session_file(session_path)
+    if error_message:
+        return f"{Path(session_path).name}（读取失败）"
+    pages = deduplicate_extension_pages(data.get("pages", []))
+    possible_job_count = len(
+        [page for page in pages if page["page_type"] in ["岗位详情页", "岗位列表页"]]
+    )
+    created_at = clean_value(data.get("created_at", "")) or clean_value(data.get("received_at", ""))
+    return f"{created_at or Path(session_path).stem}｜页面 {len(pages)}｜可能岗位 {possible_job_count}"
+
+
+def select_candidate_pages(pages):
+    detail_pages = [page for page in pages if page["page_type"] == "岗位详情页"]
+    if detail_pages:
+        return detail_pages
+
+    list_pages = [page for page in pages if page["page_type"] == "岗位列表页"]
+    if list_pages:
+        return list_pages[:1]
+
+    non_chat_pages = [page for page in pages if page["page_type"] != "聊天页"]
+    return non_chat_pages[:1]
+
+
+def import_extension_session(session_path):
+    data, error_message = load_extension_session_file(session_path)
+    result = {
+        "success_count": 0,
+        "duplicate_count": 0,
+        "parse_failed_count": 0,
+        "feishu_success_count": 0,
+        "feishu_failed_count": 0,
+        "feishu_errors": [],
+        "parse_errors": [],
+        "unmatched_chats": [],
+    }
+    if error_message:
+        result["parse_errors"].append(error_message)
+        return result
+
+    pages = deduplicate_extension_pages(data.get("pages", []))
+    chat_pages = [page for page in pages if page["page_type"] == "聊天页"]
+    support_pages = [page for page in pages if page["page_type"] in ["公司页", "地图地点页"]]
+    candidate_pages = select_candidate_pages(pages)
+
+    if not candidate_pages:
+        result["parse_errors"].append("本次会话没有可解析的岗位页面。")
+        return result
+
+    records_df = read_records()
+    feishu_config = get_feishu_config()
+    feishu_config_error = check_feishu_config(feishu_config)
+    used_chat_urls = set()
+
+    for page in candidate_pages:
+        if is_duplicate_job_record(records_df, {"岗位链接": page["page_url"]}):
+            result["duplicate_count"] += 1
+            continue
+
+        parse_text = build_session_parse_text(page, support_pages)
+        ai_result, parse_error = smart_parse_with_deepseek(parse_text)
+        if parse_error:
+            result["parse_failed_count"] += 1
+            result["parse_errors"].append(f"{page['page_title'] or page['page_url']}：{parse_error}")
+            continue
+
+        record = build_record_from_ai_parse(ai_result, page["page_title"], page["page_url"])
+        matched_chats, unmatched_chats = match_chat_pages_to_record(chat_pages, record)
+        for matched_chat in matched_chats:
+            used_chat_urls.add(matched_chat["page_url"])
+        record = append_chat_pages_to_record(record, matched_chats)
+
+        if is_duplicate_job_record(records_df, record):
+            result["duplicate_count"] += 1
+            continue
+
+        diagnosis_result, diagnosis_error = analyze_job_with_deepseek(record)
+        if diagnosis_error:
+            result["parse_errors"].append(
+                f"{record.get('公司名', '')}-{record.get('岗位名', '')}：AI分析失败，已保存基础信息。{diagnosis_error}"
+            )
+        else:
+            record = apply_diagnosis_to_record(record, diagnosis_result)
+
+        records_df = pd.concat([records_df, pd.DataFrame([record])], ignore_index=True)
+        row_index = len(records_df) - 1
+        result["success_count"] += 1
+
+        if feishu_config_error:
+            continue
+
+        sync_error = sync_record_to_feishu(record)
+        if sync_error:
+            records_df.at[row_index, "飞书同步状态"] = "同步失败"
+            result["feishu_failed_count"] += 1
+            result["feishu_errors"].append(
+                f"{record.get('公司名', '')}-{record.get('岗位名', '')}：{sync_error}"
+            )
+        else:
+            records_df.at[row_index, "飞书同步状态"] = "已同步"
+            records_df.at[row_index, "飞书同步时间"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            result["feishu_success_count"] += 1
+
+    result["unmatched_chats"] = [
+        {
+            "page_title": page["page_title"],
+            "page_url": page["page_url"],
+            "raw_text": clean_extension_page_text(page["raw_text"], max_length=1200),
+        }
+        for page in chat_pages
+        if page["page_url"] not in used_chat_urls
+    ]
+
+    save_records(records_df)
+    return result
 
 
 def get_feishu_records_url(config):
@@ -1899,6 +2422,12 @@ if "success_message" not in st.session_state:
 if "last_saved_index" not in st.session_state:
     st.session_state.last_saved_index = None
 
+if "extension_import_status" not in st.session_state:
+    st.session_state.extension_import_status = None
+
+if "handled_extension_import_key" not in st.session_state:
+    st.session_state.handled_extension_import_key = ""
+
 for field_key in FIELD_KEYS.values():
     if field_key not in st.session_state:
         st.session_state[field_key] = ""
@@ -1934,6 +2463,8 @@ if st.session_state.pending_edit_index is not None:
     load_record_to_form(st.session_state.pending_edit_index)
     st.session_state.pending_edit_index = None
 
+handle_extension_import()
+
 st.markdown("# BossPilot")
 st.caption("AI 求职投递管理与岗位诊断系统")
 
@@ -1941,113 +2472,23 @@ if st.session_state.success_message:
     st.success(st.session_state.success_message)
     st.session_state.success_message = ""
 
-st.info("飞书同步为可选功能；未配置或配置错误时，不影响截图识别和本地保存。")
+if st.session_state.extension_import_status:
+    with st.container(border=True):
+        status = st.session_state.extension_import_status
+        st.subheader(status.get("title", "Boss 网页岗位导入状态"))
+        st.markdown(f"**岗位：** {status.get('岗位', '未识别')}")
+        st.markdown(f"**公司：** {status.get('公司', '未识别')}")
+        st.markdown(f"**AI分析：** {status.get('AI分析', '未执行')}")
+        st.markdown(f"**本地保存：** {status.get('本地保存', '未完成')}")
+        st.markdown(f"**飞书同步：** {status.get('飞书同步', '未执行')}")
+
+st.info("飞书同步为可选功能；未配置或配置错误时，不影响截图识别和本地保存。飞书中可按“岗位优先级分值”降序排序，以优先查看高价值岗位。")
 
 st.subheader("推荐使用方式")
 st.markdown(
-    "- 手机端：适合上传 Boss 截图并快速生成记录\n"
-    "- 电脑端：适合查看、筛选、编辑、同步飞书和复盘"
+    "- 主流程：先一键解析或手动录入，再保存记录\n"
+    "- 记录管理：在已保存记录中进行 AI 分析、编辑、删除和同步飞书"
 )
-
-with st.container(border=True):
-    st.subheader("截图上传")
-    st.caption("建议上传 2–5 张 Boss 岗位截图，最多 10 张。")
-    st.info("手机端建议先在相册中整理好截图，再一次性选择上传。")
-    uploaded_images = st.file_uploader(
-        "上传截图",
-        type=["png", "jpg", "jpeg"],
-        accept_multiple_files=True,
-    )
-    recognition_mode = st.radio(
-        "识别模式",
-        ["快速识别", "完整识别"],
-        index=0,
-        horizontal=True,
-    )
-    if recognition_mode == "快速识别":
-        st.caption("快速识别模式下，建议把岗位详情图、公司信息图、关键HR聊天图放在前 3 张。")
-    else:
-        st.caption("完整识别会处理更多截图，耗时较长，请耐心等待。")
-
-    if uploaded_images:
-        st.success(f"上传成功 {len(uploaded_images)} 张截图")
-        st.caption(f"当前识别模式：{recognition_mode}")
-        st.caption("已压缩图片以提升识别速度。")
-        if recognition_mode == "快速识别" and len(uploaded_images) > 3:
-            st.info("快速识别模式下，系统将优先分析前 3 张截图。其余截图不会调用视觉模型。")
-        st.caption("图片预览")
-        preview_columns = st.columns(min(len(uploaded_images), 4))
-        for index, uploaded_image in enumerate(uploaded_images):
-            with preview_columns[index % len(preview_columns)]:
-                st.image(uploaded_image, caption=uploaded_image.name, use_container_width=True)
-
-    if st.button("AI读取截图并生成记录"):
-        if not uploaded_images:
-            st.warning("请先上传截图。")
-        elif len(uploaded_images) > 10:
-            st.warning("最多上传 10 张截图，请减少后重新上传。")
-        else:
-            progress_placeholder = st.empty()
-            with st.spinner("正在逐张调用视觉模型读取截图..."):
-                qwen_result, qwen_error, qwen_debug_info = call_qwen_vision_for_screenshots(
-                    uploaded_images,
-                    recognition_mode=recognition_mode,
-                    progress_placeholder=progress_placeholder,
-                )
-            progress_placeholder.empty()
-
-            if qwen_result:
-                fill_form_from_qwen_result(qwen_result)
-                for status_text in qwen_debug_info.get("每张截图识别状态", []):
-                    st.write(status_text)
-                with st.expander("每张截图提取到的信息", expanded=False):
-                    st.json(qwen_debug_info.get("每张截图识别结果", []))
-                with st.expander("每张截图调试信息", expanded=False):
-                    st.json(qwen_debug_info.get("每张截图调试信息", []))
-                with st.expander("合并后的岗位信息", expanded=False):
-                    st.json(qwen_result)
-                if qwen_error:
-                    st.warning(qwen_error)
-                if len(uploaded_images) > 1:
-                    st.info("已逐张识别多张截图，并合并为一份岗位记录。")
-                if recognition_mode == "快速识别":
-                    st.success("快速识别完成，如信息不完整，可切换完整识别或使用粘贴文本补充。")
-                else:
-                    st.success("已完成多张截图识别并合并，请检查下方表单。")
-                st.info("如需岗位价值判断，请继续点击下方“AI岗位深度诊断”。")
-            elif qwen_error.startswith("未配置 Qwen 视觉模型"):
-                st.warning(qwen_error)
-            else:
-                with st.expander("Qwen视觉模型错误详情", expanded=False):
-                    st.json(qwen_debug_info)
-                st.warning("视觉模型读取失败，正在尝试备用 OCR。")
-                with st.spinner("正在使用备用 OCR 识别截图文字..."):
-                    extracted_text, ocr_errors = extract_text_from_uploaded_images(uploaded_images)
-
-                with st.expander("备用 OCR 识别到的原始文字", expanded=False):
-                    st.text_area(
-                        "OCR 原始文字",
-                        value=extracted_text or "未识别到文字",
-                        height=220,
-                        disabled=True,
-                    )
-
-                if not extracted_text:
-                    st.error("图片理解失败，请尝试粘贴岗位文字。")
-                else:
-                    if len(uploaded_images) > 1:
-                        st.info("已合并多张截图信息进行分析。")
-
-                    with st.spinner("正在根据 OCR 文字生成求职记录..."):
-                        ai_result, error_message = smart_parse_with_deepseek(extracted_text)
-
-                    if error_message:
-                        st.error(error_message)
-                    else:
-                        fill_form_from_ai_parse(ai_result)
-                        fill_missing_screenshot_fields()
-                        st.success("图片读取完成，请检查下方表单。")
-                        st.info("如需岗位价值判断，请继续点击下方“AI岗位深度诊断”。")
 
 with st.container(border=True):
     st.subheader("粘贴岗位信息解析")
@@ -2071,7 +2512,7 @@ with st.container(border=True):
                 fill_form_from_raw_text()
                 st.warning("AI解析未完成，已尝试按规则填充可识别字段。")
             else:
-                fill_form_from_ai_parse(ai_result)
+                fill_form_from_ai_parse(ai_result, include_ai=False)
                 st.success("AI解析完成，请向下确认表单，然后点击保存记录。")
 
 form_title = "编辑投递记录" if st.session_state.edit_index is not None else "确认表单"
@@ -2088,6 +2529,7 @@ with st.form("job_record_form"):
         st.text_input("岗位方向", key="job_direction")
         st.text_input("薪资", key="salary")
         st.text_input("地点", key="location")
+        st.text_input("岗位链接", key="job_url")
 
     with col2:
         st.text_input("投递平台", key="platform")
@@ -2096,20 +2538,7 @@ with st.form("job_record_form"):
         st.text_area("备注", height=120, key="notes")
         st.text_area("聊天记录文本", height=180, key="chat_text")
 
-    ai_submitted = st.form_submit_button("AI岗位深度诊断")
     submitted = st.form_submit_button(submit_text)
-
-    if ai_submitted:
-        with st.spinner("正在分析岗位..."):
-            ai_result, error_message = analyze_job_with_deepseek()
-
-        if error_message:
-            st.error(error_message)
-        else:
-            save_ai_result_to_session(ai_result)
-            st.session_state.pending_priority_update = generate_priority_from_ai_result(ai_result)
-            st.session_state.success_message = "AI 分析完成。"
-            st.rerun()
 
     if submitted:
         records_df = read_records()
@@ -2120,9 +2549,11 @@ with st.form("job_record_form"):
             save_records(records_df)
             st.session_state.last_saved_index = len(records_df) - 1
             st.success("记录已保存")
-            st.info("如需同步飞书，请点击下方同步按钮")
         else:
             current_edit_index = st.session_state.edit_index
+            record["创建时间"] = clean_value(records_df.loc[st.session_state.edit_index, "创建时间"]) or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            record["岗位优先级"] = normalize_priority(record["岗位优先级"])
+            record["岗位优先级分值"] = str(get_priority_score(record["岗位优先级"]))
             record["飞书同步状态"] = clean_value(records_df.loc[st.session_state.edit_index, "飞书同步状态"])
             record["飞书同步时间"] = clean_value(records_df.loc[st.session_state.edit_index, "飞书同步时间"])
             for column in COLUMNS:
@@ -2130,82 +2561,8 @@ with st.form("job_record_form"):
             save_records(records_df)
             st.session_state.edit_index = None
             st.session_state.last_saved_index = current_edit_index
-            st.session_state.success_message = "记录已保存\n\n如需同步飞书，请点击下方同步按钮"
+            st.session_state.success_message = "记录已保存"
             st.rerun()
-
-if st.session_state.last_saved_index is not None:
-    records_df_for_sync = read_records()
-    if 0 <= st.session_state.last_saved_index < len(records_df_for_sync):
-        with st.container(border=True):
-            st.subheader("保存与同步")
-            st.success("记录已保存")
-            st.caption("如需同步飞书，请点击下方同步按钮。飞书同步失败不会影响本地保存。")
-
-            if st.button("同步刚保存的记录到飞书"):
-                sync_index = st.session_state.last_saved_index
-                record_to_sync = records_df_for_sync.iloc[sync_index]
-                with st.spinner("正在同步到飞书..."):
-                    error_message = sync_record_to_feishu(record_to_sync)
-
-                if error_message:
-                    st.error(error_message)
-                    st.text(get_feishu_config_status_text())
-                else:
-                    records_df_for_sync.loc[sync_index, "飞书同步状态"] = "已同步"
-                    records_df_for_sync.loc[sync_index, "飞书同步时间"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    save_records(records_df_for_sync)
-                    st.success("同步到飞书成功")
-
-st.subheader("AI 岗位分析结果")
-if any(clean_value(st.session_state[key]) for key in list(AI_FIELD_KEYS.values()) + list(DIAGNOSIS_FIELD_KEYS.values())):
-    score_col1, score_col2, score_col3, score_col4, score_col5 = st.columns(5)
-    score_col1.metric("产品相关度", st.session_state.product_relevance or "0")
-    score_col2.metric("AI/数据/SaaS相关度", st.session_state.ai_data_saas_relevance or "0")
-    score_col3.metric("简历增值程度", st.session_state.resume_value or "0")
-    score_col4.metric("低价值杂活风险", st.session_state.low_value_risk or "0")
-    score_col5.metric("成长路径清晰度", st.session_state.growth_clarity or "0")
-
-    with st.container(border=True):
-        st.markdown(f"**岗位真实类型：** {clean_value(st.session_state.real_job_type) or '待判断'}")
-        st.markdown(f"**是否值得继续沟通：** {clean_value(st.session_state.worth_following) or '待判断'}")
-        if clean_value(st.session_state.overall_priority):
-            st.markdown(f"**综合优先级：** {st.session_state.overall_priority}")
-        if clean_value(st.session_state.parse_confidence):
-            st.markdown(f"**解析置信度：** {st.session_state.parse_confidence}")
-        if clean_value(st.session_state.parse_notes):
-            st.markdown(f"**解析说明：** {st.session_state.parse_notes}")
-        st.markdown("**判断理由**")
-        if clean_value(st.session_state.reasoning):
-            st.write(st.session_state.reasoning)
-        else:
-            st.caption("暂无")
-        if clean_value(st.session_state.interview_advice):
-            st.markdown("**面试表达建议**")
-            st.write(st.session_state.interview_advice)
-
-    st.markdown("**需要追问 HR 的 3 个关键问题**")
-    questions = [question for question in st.session_state.hr_questions.splitlines() if clean_value(question)]
-    if questions:
-        for question in questions:
-            st.markdown(f"- {question}")
-    else:
-        st.caption("暂无")
-
-    st.markdown("**建议回复话术**")
-    st.text_area("建议回复话术", value=st.session_state.reply_script, height=120, disabled=True)
-else:
-    st.info("还没有 AI 分析结果。")
-
-if st.button("清空当前AI分析结果"):
-    clear_ai_result_from_session()
-
-    if st.session_state.edit_index is not None:
-        records_df = read_records()
-        records_df = clear_ai_result_from_record(records_df, st.session_state.edit_index)
-        save_records(records_df)
-
-    st.session_state.success_message = "AI分析结果已清空"
-    st.rerun()
 
 st.divider()
 st.subheader("已保存的全部记录")
@@ -2258,7 +2615,7 @@ else:
                     ]
                     if part
                 ),
-                "飞书同步状态": clean_value(row["飞书同步状态"]),
+                "飞书同步状态": clean_value(row["飞书同步状态"]) or "未同步",
             }
             core_record = {key: value for key, value in core_record.items() if clean_value(value)}
             st.dataframe(pd.DataFrame([core_record]), use_container_width=True, hide_index=True)
@@ -2344,6 +2701,8 @@ else:
                         error_message = sync_record_to_feishu(row)
 
                     if error_message:
+                        records_df.loc[row_index, "飞书同步状态"] = "同步失败"
+                        save_records(records_df)
                         st.error(error_message)
                         st.text(get_feishu_config_status_text())
                     else:
@@ -2355,6 +2714,159 @@ else:
                         else:
                             st.session_state.success_message = "同步到飞书成功。"
                         st.rerun()
+
+with st.expander("高级功能：截图/会话导入", expanded=False):
+    st.info("该功能用于后续扩展，目前主流程建议使用手动录入或一键解析填充。")
+
+    with st.container(border=True):
+        st.subheader("截图上传")
+        st.caption("建议上传 2–5 张 Boss 岗位截图，最多 10 张。")
+        st.info("手机端建议先在相册中整理好截图，再一次性选择上传。")
+        uploaded_images = st.file_uploader(
+            "上传截图",
+            type=["png", "jpg", "jpeg"],
+            accept_multiple_files=True,
+        )
+        recognition_mode = st.radio(
+            "识别模式",
+            ["快速识别", "完整识别"],
+            index=0,
+            horizontal=True,
+        )
+        if recognition_mode == "快速识别":
+            st.caption("快速识别模式下，建议把岗位详情图、公司信息图、关键HR聊天图放在前 3 张。")
+        else:
+            st.caption("完整识别会处理更多截图，耗时较长，请耐心等待。")
+
+        if uploaded_images:
+            st.success(f"上传成功 {len(uploaded_images)} 张截图")
+            st.caption(f"当前识别模式：{recognition_mode}")
+            st.caption("已压缩图片以提升识别速度。")
+            if recognition_mode == "快速识别" and len(uploaded_images) > 3:
+                st.info("快速识别模式下，系统将优先分析前 3 张截图。其余截图不会调用视觉模型。")
+            st.caption("图片预览")
+            preview_columns = st.columns(min(len(uploaded_images), 4))
+            for index, uploaded_image in enumerate(uploaded_images):
+                with preview_columns[index % len(preview_columns)]:
+                    st.image(uploaded_image, caption=uploaded_image.name, use_container_width=True)
+
+        if st.button("AI读取截图并生成记录"):
+            if not uploaded_images:
+                st.warning("请先上传截图。")
+            elif len(uploaded_images) > 10:
+                st.warning("最多上传 10 张截图，请减少后重新上传。")
+            else:
+                progress_placeholder = st.empty()
+                with st.spinner("正在逐张调用视觉模型读取截图..."):
+                    qwen_result, qwen_error, qwen_debug_info = call_qwen_vision_for_screenshots(
+                        uploaded_images,
+                        recognition_mode=recognition_mode,
+                        progress_placeholder=progress_placeholder,
+                    )
+                progress_placeholder.empty()
+
+                if qwen_result:
+                    fill_form_from_qwen_result(qwen_result)
+                    with st.expander("截图识别摘要", expanded=False):
+                        for status_text in qwen_debug_info.get("每张截图识别状态", []):
+                            st.write(status_text)
+                    with st.expander("每张截图提取到的信息", expanded=False):
+                        st.json(qwen_debug_info.get("每张截图识别结果", []))
+                    with st.expander("每张截图调试信息", expanded=False):
+                        st.json(qwen_debug_info.get("每张截图调试信息", []))
+                    with st.expander("合并后的岗位信息", expanded=False):
+                        st.json(qwen_result)
+                    if qwen_error:
+                        st.warning(qwen_error)
+                    if len(uploaded_images) > 1:
+                        st.info("已逐张识别多张截图，并合并为一份岗位记录。")
+                    if recognition_mode == "快速识别":
+                        st.success("快速识别完成，如信息不完整，可切换完整识别或使用粘贴文本补充。")
+                    else:
+                        st.success("已完成多张截图识别并合并，请检查上方表单。")
+                    st.info("确认保存后，可在记录列表点击“AI分析此记录”。")
+                elif qwen_error.startswith("未配置 Qwen 视觉模型"):
+                    st.warning(qwen_error)
+                else:
+                    with st.expander("Qwen视觉模型错误详情", expanded=False):
+                        st.json(qwen_debug_info)
+                    st.warning("视觉模型读取失败，正在尝试备用 OCR。")
+                    with st.spinner("正在使用备用 OCR 识别截图文字..."):
+                        extracted_text, ocr_errors = extract_text_from_uploaded_images(uploaded_images)
+
+                    with st.expander("备用 OCR 识别到的原始文字", expanded=False):
+                        st.text_area(
+                            "OCR 原始文字",
+                            value=extracted_text or "未识别到文字",
+                            height=220,
+                            disabled=True,
+                        )
+
+                    if not extracted_text:
+                        st.error("图片理解失败，请尝试粘贴岗位文字。")
+                    else:
+                        if len(uploaded_images) > 1:
+                            st.info("已合并多张截图信息进行分析。")
+
+                        with st.spinner("正在根据 OCR 文字生成求职记录..."):
+                            ai_result, error_message = smart_parse_with_deepseek(extracted_text)
+
+                        if error_message:
+                            st.error(error_message)
+                        else:
+                            fill_form_from_ai_parse(ai_result, include_ai=False)
+                            fill_missing_screenshot_fields()
+                            st.success("图片读取完成，请检查上方表单。")
+                            st.info("确认保存后，可在记录列表点击“AI分析此记录”。")
+
+    with st.container(border=True):
+        st.subheader("导入浏览器监控会话")
+        st.caption("先启动本地接收器，再用 Chrome 插件“开始监控 / 结束并上传”。上传后可在这里批量导入、AI分析、保存和可选同步飞书。")
+        session_files = list_extension_session_files()
+
+        if not session_files:
+            st.info("暂无可导入的浏览器监控会话。请先运行 local_receiver.py，并在插件中结束并上传。")
+        else:
+            session_options = {
+                f"{summarize_extension_session_file(path)}｜{path.name}": str(path)
+                for path in session_files
+            }
+            selected_session_label = st.selectbox("选择会话", list(session_options.keys()))
+            selected_session_path = session_options[selected_session_label]
+
+            if st.button("导入并分析本次会话"):
+                with st.spinner("正在导入会话、解析岗位并进行 AI 分析..."):
+                    st.session_state.extension_session_import_result = import_extension_session(selected_session_path)
+
+        session_import_result = st.session_state.get("extension_session_import_result")
+        if session_import_result:
+            st.success(f"成功生成 {session_import_result.get('success_count', 0)} 条岗位记录。")
+            st.info(
+                f"跳过重复记录 {session_import_result.get('duplicate_count', 0)} 条；"
+                f"解析失败 {session_import_result.get('parse_failed_count', 0)} 条；"
+                f"飞书同步成功 {session_import_result.get('feishu_success_count', 0)} 条；"
+                f"飞书同步失败 {session_import_result.get('feishu_failed_count', 0)} 条。"
+            )
+            if session_import_result.get("parse_errors"):
+                with st.expander("解析或 AI 分析提示", expanded=False):
+                    for error_message in session_import_result["parse_errors"]:
+                        st.write(error_message)
+            if session_import_result.get("feishu_errors"):
+                with st.expander("飞书同步失败详情", expanded=False):
+                    for error_message in session_import_result["feishu_errors"]:
+                        st.write(error_message)
+            if session_import_result.get("unmatched_chats"):
+                with st.expander("未匹配聊天记录", expanded=False):
+                    for chat_index, chat_page in enumerate(session_import_result["unmatched_chats"], start=1):
+                        st.markdown(f"**{chat_page.get('page_title', '未命名聊天页')}**")
+                        st.caption(chat_page.get("page_url", ""))
+                        st.text_area(
+                            "聊天文本",
+                            value=chat_page.get("raw_text", ""),
+                            height=140,
+                            disabled=True,
+                            key=f"unmatched_chat_{chat_index}",
+                        )
 
 st.divider()
 st.subheader("危险操作")
