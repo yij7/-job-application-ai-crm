@@ -2463,7 +2463,14 @@ if st.session_state.pending_edit_index is not None:
     load_record_to_form(st.session_state.pending_edit_index)
     st.session_state.pending_edit_index = None
 
-handle_extension_import()
+page_mode = st.selectbox(
+    "使用模式",
+    ["普通用户版", "高级管理版"],
+    key="page_mode",
+)
+
+if page_mode == "高级管理版":
+    handle_extension_import()
 
 st.markdown("# BossPilot")
 st.caption("AI 求职投递管理与岗位诊断系统")
@@ -2472,7 +2479,7 @@ if st.session_state.success_message:
     st.success(st.session_state.success_message)
     st.session_state.success_message = ""
 
-if st.session_state.extension_import_status:
+if page_mode == "高级管理版" and st.session_state.extension_import_status:
     with st.container(border=True):
         status = st.session_state.extension_import_status
         st.subheader(status.get("title", "Boss 网页岗位导入状态"))
@@ -2481,6 +2488,167 @@ if st.session_state.extension_import_status:
         st.markdown(f"**AI分析：** {status.get('AI分析', '未执行')}")
         st.markdown(f"**本地保存：** {status.get('本地保存', '未完成')}")
         st.markdown(f"**飞书同步：** {status.get('飞书同步', '未执行')}")
+
+if page_mode == "普通用户版":
+    st.info("上传 BOSS 岗位截图，系统会自动整理岗位信息。识别不准确时，可以手动修改确认表格。")
+
+    with st.container(border=True):
+        st.subheader("上传截图")
+        st.caption("上传 BOSS 岗位页、公司介绍或 HR 聊天截图，最多 10 张。")
+        user_uploaded_images = st.file_uploader(
+            "上传 BOSS 岗位截图",
+            type=["png", "jpg", "jpeg"],
+            accept_multiple_files=True,
+            key="user_uploaded_images",
+        )
+        user_recognition_mode = st.radio(
+            "识别模式",
+            ["快速识别", "完整识别"],
+            index=0,
+            horizontal=True,
+            key="user_recognition_mode",
+        )
+
+        if user_uploaded_images:
+            st.caption(f"已上传 {len(user_uploaded_images)} 张截图。")
+            preview_columns = st.columns(min(len(user_uploaded_images), 4))
+            for index, uploaded_image in enumerate(user_uploaded_images):
+                with preview_columns[index % len(preview_columns)]:
+                    st.image(uploaded_image, caption=uploaded_image.name, use_container_width=True)
+
+        if st.button("识别截图并填入表格", key="user_parse_images"):
+            if not user_uploaded_images:
+                st.warning("请先上传截图。")
+            elif len(user_uploaded_images) > 10:
+                st.warning("最多上传 10 张截图，请减少后重新上传。")
+            else:
+                progress_placeholder = st.empty()
+                with st.spinner("正在识别截图..."):
+                    qwen_result, qwen_error, qwen_debug_info = call_qwen_vision_for_screenshots(
+                        user_uploaded_images,
+                        recognition_mode=user_recognition_mode,
+                        progress_placeholder=progress_placeholder,
+                    )
+                progress_placeholder.empty()
+
+                if qwen_result:
+                    fill_form_from_qwen_result(qwen_result)
+                    st.success("截图识别完成，请检查下方确认表格。")
+                    if qwen_error:
+                        st.warning(qwen_error)
+                    with st.expander("识别详情", expanded=False):
+                        st.json(qwen_debug_info.get("合并后的岗位信息", qwen_result))
+                else:
+                    st.warning("截图识别暂时不可用，请改用下方粘贴岗位信息。")
+                    with st.expander("错误详情", expanded=False):
+                        st.json(qwen_debug_info)
+
+    with st.container(border=True):
+        st.subheader("粘贴岗位信息")
+        st.caption("截图识别失败或信息不完整时，可粘贴 BOSS 岗位详情、公司介绍、HR 聊天记录等文本。")
+        st.text_area(
+            "岗位信息文本",
+            height=160,
+            key="smart_raw_text",
+            placeholder="粘贴岗位详情、公司介绍或 HR 聊天记录。",
+        )
+
+        if st.button("一键解析并填充", key="user_parse_text"):
+            if not clean_value(st.session_state.smart_raw_text):
+                st.warning("请先粘贴岗位信息。")
+            else:
+                with st.spinner("正在解析岗位信息..."):
+                    ai_result, error_message = smart_parse_with_deepseek(st.session_state.smart_raw_text)
+
+                if error_message:
+                    st.session_state.raw_job_text = st.session_state.smart_raw_text
+                    fill_form_from_raw_text()
+                    st.warning("AI解析未完成，已按规则填充可识别字段。")
+                else:
+                    fill_form_from_ai_parse(ai_result, include_ai=False)
+                    st.success("解析完成，请检查下方确认表格。")
+
+    with st.form("user_job_record_form"):
+        st.subheader("确认表格")
+        st.caption("识别不准确时，可以在这里手动修改。")
+
+        col1, col2 = st.columns(2)
+        with col1:
+            st.text_input("公司名", key="company_name")
+            st.text_input("岗位名", key="job_title")
+            st.text_input("岗位方向", key="job_direction")
+            st.text_input("薪资", key="salary")
+            st.text_input("地点", key="location")
+        with col2:
+            st.text_input("投递平台", key="platform")
+            st.selectbox("投递状态", STATUS_OPTIONS, key="status")
+            st.selectbox("岗位优先级", PRIORITY_OPTIONS, key="priority")
+            st.text_area("备注", height=100, key="notes")
+            st.text_area("聊天记录文本", height=150, key="chat_text")
+
+        user_submitted = st.form_submit_button("保存记录")
+
+        if user_submitted:
+            records_df = read_records()
+            record = get_form_record()
+            records_df = pd.concat([records_df, pd.DataFrame([record])], ignore_index=True)
+            save_records(records_df)
+            st.session_state.last_saved_index = len(records_df) - 1
+            st.success("记录已保存")
+
+    records_df_for_user = read_records()
+    latest_record = None
+    if st.session_state.last_saved_index is not None and 0 <= st.session_state.last_saved_index < len(records_df_for_user):
+        latest_record = records_df_for_user.iloc[st.session_state.last_saved_index]
+
+    if latest_record is not None:
+        with st.container(border=True):
+            st.subheader("AI 岗位分析结果")
+            st.caption("保存后可生成岗位判断和推荐回复话术。")
+
+            if st.button("AI分析刚保存的记录", key="user_analyze_latest"):
+                with st.spinner("正在分析岗位..."):
+                    ai_result, error_message = analyze_job_with_deepseek(latest_record)
+
+                if error_message:
+                    st.error(error_message)
+                else:
+                    ai_record = get_ai_record_from_result(ai_result)
+                    records_df_for_user = write_ai_record_to_df(
+                        records_df_for_user,
+                        st.session_state.last_saved_index,
+                        ai_record,
+                    )
+                    records_df_for_user.at[
+                        st.session_state.last_saved_index,
+                        "岗位优先级",
+                    ] = generate_priority_from_ai_result(ai_result)
+                    save_records(records_df_for_user)
+                    st.session_state.success_message = "AI分析完成"
+                    st.rerun()
+
+            latest_record = read_records().iloc[st.session_state.last_saved_index]
+            if any(clean_value(latest_record.get(column, "")) for column in ALL_AI_COLUMNS):
+                score_col1, score_col2, score_col3 = st.columns(3)
+                score_col1.metric("产品相关度", clean_value(latest_record.get("产品相关度", "")) or "待判断")
+                score_col2.metric("简历增值程度", clean_value(latest_record.get("简历增值程度", "")) or "待判断")
+                score_col3.metric("杂活风险", clean_value(latest_record.get("低价值杂活风险", "")) or "待判断")
+                st.markdown(f"**岗位真实类型：** {clean_value(latest_record.get('岗位真实类型判断', '')) or '待判断'}")
+                st.markdown(f"**是否值得继续沟通：** {clean_value(latest_record.get('是否值得继续沟通', '')) or '待判断'}")
+                if clean_value(latest_record.get("判断理由", "")):
+                    st.markdown("**判断理由**")
+                    st.write(clean_value(latest_record.get("判断理由", "")))
+                st.markdown("**推荐回复话术**")
+                st.text_area(
+                    "推荐回复话术",
+                    value=clean_value(latest_record.get("建议回复话术", "")),
+                    height=140,
+                    disabled=True,
+                )
+            else:
+                st.info("还没有 AI 分析结果。点击上方按钮生成。")
+
+    st.stop()
 
 st.info("飞书同步为可选功能；未配置或配置错误时，不影响截图识别和本地保存。飞书中可按“岗位优先级分值”降序排序，以优先查看高价值岗位。")
 
